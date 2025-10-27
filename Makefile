@@ -9,8 +9,12 @@ test: deps
 ethsign: ${SRC_GOFILES}
 		$(VGO) build -o ${BINARY_NAME} -ldflags "-X main.buildDate=`date -u +\"%Y-%m-%dT%H:%M:%SZ\"` -X main.buildVersion=$(BUILD_VERSION)" -tags=prod -v
 build: ethsign
+ethsign-linux-arm64: ${SRC_GOFILES}
+		GOOS=linux GOARCH=arm64 $(VGO) build -o ${BINARY_NAME} -ldflags "-X main.buildDate=`date -u +\"%Y-%m-%dT%H:%M:%SZ\"` -X main.buildVersion=$(BUILD_VERSION)" -tags=prod -v
+build-linux-arm64: ethsign-linux-arm64
 clean: 
 		$(VGO) clean
 		rm -f ${BINARY_NAME}
+		rm -f ${BINARY_NAME}-linux-arm64
 deps:
 		$(VGO) get
