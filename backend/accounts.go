@@ -29,6 +29,8 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/hashicorp/vault/sdk/framework"
 	"github.com/hashicorp/vault/sdk/logical"
+	"github.com/kaleido-io/vault-plugin-secrets-ethsign/pre/recrypt"
+	"github.com/kaleido-io/vault-plugin-secrets-ethsign/pre/utils"
 	"golang.org/x/crypto/sha3"
 )
 
@@ -50,6 +52,9 @@ func paths(b *backend) []*framework.Path {
 		pathReadAndDelete(b),
 		pathSign(b),
 		pathExport(b),
+		pathDecryptCapsuleWithOwnerKey(b),
+		pathDecryptCapsuleWithViewerKey(b),
+		pathCreateRekey(b),
 	}
 }
 
@@ -70,12 +75,12 @@ func (b *backend) createAccount(ctx context.Context, req *logical.Request, data 
 	var err error
 
 	if keyInput != "" {
-    re := regexp.MustCompile("[0-9a-fA-F]{64}$")
-    key := re.FindString(keyInput)
-    if key == "" {
-      b.Logger().Error("Input private key did not parse successfully", "privateKey", keyInput)
-      return nil, fmt.Errorf("privateKey must be a 32-byte hexidecimal string")
-    }
+		re := regexp.MustCompile("[0-9a-fA-F]{64}$")
+		key := re.FindString(keyInput)
+		if key == "" {
+			b.Logger().Error("Input private key did not parse successfully", "privateKey", keyInput)
+			return nil, fmt.Errorf("privateKey must be a 32-byte hexidecimal string")
+		}
 		privateKey, err = crypto.HexToECDSA(key)
 		if err != nil {
 			b.Logger().Error("Error reconstructing private key from input hex", "error", err)
@@ -310,4 +315,160 @@ func ZeroKey(k *ecdsa.PrivateKey) {
 	for i := range b {
 		b[i] = 0
 	}
+}
+
+func (b *backend) createRekey(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
+	issuerAddress := data.Get("name").(string)
+	viewerPublicKeyHex := data.Get("publicKey").(string)
+
+	if viewerPublicKeyHex == "" {
+		return nil, fmt.Errorf("viewerPublicKey is required")
+	}
+
+	// Get account from vault storage
+	account, err := b.retrieveAccount(ctx, req, issuerAddress)
+	if err != nil {
+		b.Logger().Error("Failed to retrieve the issuer account", "address", issuerAddress, "error", err)
+
+		return nil, fmt.Errorf("error retrieving issuer account %s", issuerAddress)
+	}
+
+	if account == nil {
+		return nil, fmt.Errorf("issuer account %s does not exist", issuerAddress)
+	}
+
+	// convert account.PrivateKey to ECDSA private key
+	ownerPrivateKey, err := utils.PrivateKeyStrToKey(account.PrivateKey)
+	if err != nil {
+		b.Logger().Error("Failed to convert private key", "error", err)
+
+		return nil, fmt.Errorf("failed to convert private key: %v", err)
+	}
+
+	//convert viewPublic key to ECDSA public key
+	//remove 0x prefix
+	viewerPublicKeyHex = removeHexPrefix(viewerPublicKeyHex)
+	viewerPublicKey, err := utils.PublicKeyStrToKey(viewerPublicKeyHex)
+	if err != nil {
+		b.Logger().Error("Failed to convert public key", "error", err)
+
+		return nil, fmt.Errorf("failed to convert public key: %v", err)
+	}
+
+	kfragBytes, err := recrypt.CreateRekey(ownerPrivateKey, viewerPublicKey)
+	if err != nil {
+		b.Logger().Error("Failed to create rekey", "error", err)
+
+		return nil, fmt.Errorf("failed to create rekey: %v", err)
+	}
+
+	return &logical.Response{
+		Data: map[string]interface{}{
+			"kfrag": hexutil.Encode(kfragBytes),
+		},
+	}, nil
+
+}
+
+func (b *backend) decryptDataWithOwnerKey(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
+	ownerAddress := data.Get("name").(string)
+	capsuleBytes := data.Get("capsuleBytes").([]byte)
+
+	if capsuleBytes == nil {
+		return nil, fmt.Errorf("capsuleBytes is required")
+	}
+
+	// Get account from vault storage
+	account, err := b.retrieveAccount(ctx, req, ownerAddress)
+	if err != nil {
+		b.Logger().Error("Failed to retrieve the owner account", "address", ownerAddress, "error", err)
+		return nil, fmt.Errorf("error retrieving owner account %s", ownerAddress)
+	}
+	if account == nil {
+		return nil, fmt.Errorf("owner account %s does not exist", ownerAddress)
+	}
+
+	// convert account.PrivateKey to ECDSA private key
+	ownerPrivateKey, err := utils.PrivateKeyStrToKey(account.PrivateKey)
+	if err != nil {
+		b.Logger().Error("Failed to convert private key", "error", err)
+
+		return nil, fmt.Errorf("failed to convert private key: %v", err)
+	}
+
+	AESKey, err := recrypt.RecreateAESKeyByOwner(capsuleBytes, ownerPrivateKey)
+	if err != nil {
+		b.Logger().Error("Failed to recreate AES key", "error", err)
+
+		return nil, fmt.Errorf("failed to recreate AES key: %v", err)
+	}
+
+	return &logical.Response{
+		Data: map[string]interface{}{
+			"AESKey": hexutil.Encode(AESKey),
+		},
+	}, nil
+
+}
+
+func (b *backend) decryptDataWithViewerKey(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
+	viewerAddress := data.Get("name").(string)
+	capsuleBytes := data.Get("capsuleBytes").([]byte)
+	issuerPublicKey := data.Get("issuerPublicKey").(string)
+
+	if capsuleBytes == nil {
+		return nil, fmt.Errorf("capsuleBytes is required")
+	}
+
+	if issuerPublicKey == "" {
+		return nil, fmt.Errorf("issuerPublicKey is required")
+	}
+
+	// Get account from vault storage
+	account, err := b.retrieveAccount(ctx, req, viewerAddress)
+	if err != nil {
+		b.Logger().Error("Failed to retrieve the viewer account", "address", viewerAddress, "error", err)
+
+		return nil, fmt.Errorf("error retrieving viewer account %s", viewerAddress)
+	}
+
+	if account == nil {
+		return nil, fmt.Errorf("viewer account %s does not exist", viewerAddress)
+	}
+
+	// convert account.PrivateKey to ECDSA private key
+	viewerPrivateKey, err := utils.PrivateKeyStrToKey(account.PrivateKey)
+	if err != nil {
+		b.Logger().Error("Failed to convert private key", "error", err)
+
+		return nil, fmt.Errorf("failed to convert private key: %v", err)
+	}
+
+	// convert issuerPublicKey to ECDSA public key
+	issuerPublicKeyKey, err := utils.PublicKeyStrToKey(issuerPublicKey)
+	if err != nil {
+		b.Logger().Error("Failed to convert public key", "error", err)
+
+		return nil, fmt.Errorf("failed to convert public key: %v", err)
+	}
+
+	AESKey, err := recrypt.DecryptKeyGenByCapsule(viewerPrivateKey, capsuleBytes, issuerPublicKeyKey)
+	if err != nil {
+		b.Logger().Error("Failed to decrypt key gen", "error", err)
+
+		return nil, fmt.Errorf("failed to decrypt key gen: %v", err)
+	}
+
+	return &logical.Response{
+		Data: map[string]interface{}{
+			"data": hexutil.Encode(AESKey),
+		},
+	}, nil
+}
+
+func removeHexPrefix(s string) string {
+	if len(s) > 2 && s[0:2] == "0x" {
+		return s[2:]
+	}
+	return s
 }
